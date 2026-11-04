@@ -273,6 +273,8 @@ class RolloutConfig(BaseConfig):
 
     qat_fake_quant: bool = False
 
+    quantized_weight_sync: bool = False
+
     enable_rollout_routing_replay: bool = False
 
     enable_sleep_mode: bool = True
@@ -285,6 +287,16 @@ class RolloutConfig(BaseConfig):
 
     def __post_init__(self):
         """Validate the rollout config"""
+        if self.quantized_weight_sync:
+            if self.name != "vllm" or self.qat_fake_quant:
+                raise ValueError("quantized_weight_sync requires vllm with qat_fake_quant=False")
+            if self.quantization not in (None, "ascend") or self.quantization_config_file is not None:
+                raise ValueError("quantized_weight_sync supplies its own Ascend quantization description")
+            if self.checkpoint_engine.get("backend", "naive") != "naive":
+                raise ValueError("quantized_weight_sync requires the colocated naive checkpoint backend")
+            if (self.mtp and self.mtp.get("enable", False)) or self.layered_summon:
+                raise ValueError("quantized_weight_sync does not support MTP or layered_summon")
+
         # Deprecation warning for mode field - only async mode is supported
         if self.mode == "sync":
             raise ValueError(

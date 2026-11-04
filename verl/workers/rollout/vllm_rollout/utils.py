@@ -220,7 +220,9 @@ class vLLMColocateWorkerExtension:
             # patch weight loader to support MoE model
             patch_vllm_moe_model_weight_loader(model)
 
-    def update_weights_from_ipc(self, peft_config: dict = None, base_sync_done=False, use_shm: bool = False):
+    def update_weights_from_ipc(
+        self, peft_config: dict = None, base_sync_done=False, use_shm: bool = False, prequantized: bool = False
+    ):
         """Update the weights of the rollout model."""
         from vllm.platforms import current_platform
 
@@ -228,6 +230,24 @@ class vLLMColocateWorkerExtension:
 
         if current_platform.device_type == "npu" and self.device is None:
             self.device = torch.device(f"npu:{self.local_rank}")
+
+        if prequantized:
+            if peft_config or self._use_mtp_drafter_weight_sync():
+                raise ValueError("Prequantized weight sync does not support LoRA or a speculative draft model")
+            from verl.utils.vllm.prequantized_weights import (
+                PrequantizedWeightLoad,
+                bootstrap_config_from_load_config,
+            )
+
+            config = bootstrap_config_from_load_config(self.model_runner.vllm_config.load_config)
+            model = self.model_runner.model
+            patch_vllm_moe_model_weight_loader(model)
+            load = PrequantizedWeightLoad(model, config["manifest"])
+            assert self.device is not None
+            receiver = BucketedWeightReceiver(self._get_zmq_handle(), device=self.device, use_shm=use_shm)
+            receiver.receive_weights(load.load_bucket)
+            load.finish()
+            return
 
         # In async mode, make sure the old lora is removed before adding the new one
         if peft_config and base_sync_done:

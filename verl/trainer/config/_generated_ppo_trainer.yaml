@@ -398,6 +398,7 @@ actor_rollout_ref:
     quantization: null
     quantization_config_file: null
     qat_fake_quant: false
+    quantized_weight_sync: false
     mtp: ${oc.select:actor_rollout_ref.model.mtp, null}
     qat: ${oc.select:actor_rollout_ref.actor.fsdp_config.qat,null}
     disaggregation:

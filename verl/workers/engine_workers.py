@@ -699,6 +699,55 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         assert "actor" in self.role, "save_checkpoint only support actor role"
         self.actor.save_checkpoint(local_path, hdfs_path, global_step, max_ckpt_to_keep)
 
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def prepare_quantized_weight_sync(self):
+        """Describe the current actor and offload it before inference device initialization."""
+        if not self.config.rollout.get("quantized_weight_sync", False):
+            raise ValueError("quantized_weight_sync is not enabled")
+        if self.config.actor.strategy != "fsdp2" or get_device_name() != "npu":
+            raise ValueError("quantized_weight_sync currently requires FSDP2 on Ascend")
+        if not self.actor.engine.is_param_offload_enabled:
+            raise ValueError("quantized_weight_sync requires actor parameter offload for colocated startup")
+        plan = self.actor.engine.get_ascend_weight_sync_plan()
+        self.actor.to("cpu", model=True, optimizer=self.actor.engine.engine_config.optimizer_offload, grad=True)
+        if "ref" in self.role and self.ref.engine.is_param_offload_enabled:
+            self.ref.to("cpu", model=True, optimizer=False, grad=False)
+        aggressive_empty_cache(force_sync=True)
+        local_rank = self.rollout.rollout_rank % int(os.environ["RAY_LOCAL_WORLD_SIZE"])
+        return {
+            "worker_id": f"replica-{self.rollout.replica_rank}-rank-{local_rank}",
+            "zmq_handle": self.rollout.zmq_handle,
+            "use_shm": self.rollout.use_shm,
+            "quant_description": plan.quant_description,
+            "manifest": plan.manifest,
+        }
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
+    async def bootstrap_quantized_weights(self):
+        """Send the first batch without calling an engine that is still initializing."""
+        from verl.workers.rollout.vllm_rollout.bucketed_weight_transfer import BucketedWeightSender
+
+        if not self.config.rollout.get("quantized_weight_sync", False):
+            raise ValueError("quantized_weight_sync is not enabled")
+        set_expandable_segments(False)
+        weights = None
+        try:
+            weights, peft_config = self.actor.engine.get_per_tensor_param(prequantized=True)
+            if peft_config is not None:
+                raise ValueError("quantized_weight_sync does not support LoRA")
+            sender = BucketedWeightSender(
+                zmq_handle=self.rollout.zmq_handle,
+                bucket_size_mb=self.config.rollout.checkpoint_engine.update_weights_bucket_megabytes,
+                use_shm=self.rollout.use_shm,
+            )
+            await sender.async_send_weights(weights)
+        finally:
+            if weights is not None and hasattr(weights, "close"):
+                weights.close()
+            self.actor.to("cpu", model=True, optimizer=False, grad=False)
+            aggressive_empty_cache(force_sync=True)
+            set_expandable_segments(True)
+
     @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
     async def update_weights(self, global_steps: int = None, mode: str = "auto"):
         """Update weights from trainer to rollout.
@@ -728,6 +777,10 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         # Resolve mode: "auto" falls back to config, explicit values take precedence
         effective_mode = mode if mode != "auto" else self.config.rollout.checkpoint_engine.backend
+        prequantized = self.config.rollout.get("quantized_weight_sync", False)
+        if prequantized and effective_mode != "naive":
+            raise ValueError("quantized_weight_sync requires the naive checkpoint backend")
+        export_kwargs = {"prequantized": True} if prequantized else {}
 
         # 0. send_weights only for async training with disaggregated trainer and rollout
         if effective_mode != "naive":
@@ -745,7 +798,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         # 2. determine if we need a base weight sync (adapter path only)
         per_tensor_param, peft_config = self.actor.engine.get_per_tensor_param(
-            layered_summon=self.layered_summon, base_sync_done=True
+            layered_summon=self.layered_summon, base_sync_done=True, **export_kwargs
         )
 
         do_lora_base_sync = False
@@ -763,7 +816,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             )
 
         await self.rollout.update_weights(
-            per_tensor_param, peft_config=peft_config, base_sync_done=True, global_steps=global_steps
+            per_tensor_param, peft_config=peft_config, base_sync_done=True, global_steps=global_steps, **export_kwargs
         )
 
         log_gpu_memory_usage("After update_weights", logger=logger)

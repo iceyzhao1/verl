@@ -820,7 +820,26 @@ class FSDPEngine(BaseEngine):
         if self._is_offload_optimizer:
             offload_fsdp_optimizer(self.optimizer)
 
-    def get_per_tensor_param(self, layered_summon=False, base_sync_done=False, **kwargs):
+    def get_ascend_weight_sync_plan(self):
+        """Resolve the actual FSDP2 modules once; collect metadata without gathering tensors."""
+        if self.engine_config.strategy != "fsdp2" or not self._qat_enabled:
+            raise ValueError("quantized_weight_sync requires FSDP2 with actor QAT enabled")
+        if self._is_lora or hasattr(self.module, "peft_config"):
+            raise ValueError("quantized_weight_sync does not support LoRA")
+        if not hasattr(self, "_ascend_weight_sync_plan"):
+            from verl.utils.qat.ascend_weight_sync import (
+                build_ascend_weight_sync_plan,
+                collect_ascend_module_specs,
+            )
+
+            specs = collect_ascend_module_specs(self.module)
+            self._ascend_weight_sync_plan = build_ascend_weight_sync_plan(
+                self._qat_config, specs, param_dtype=self._autocast_dtype
+            )
+        return self._ascend_weight_sync_plan
+
+    def get_per_tensor_param(self, layered_summon=False, base_sync_done=False, prequantized=False, **kwargs):
+        plan = self.get_ascend_weight_sync_plan() if prequantized else None
         log_gpu_memory_usage("Before load_fsdp_model_to_gpu", logger=logger)
 
         # FSDP2 CPUOffloadPolicy owns CPU<->GPU placement; calling model.to(device) here
@@ -867,12 +886,21 @@ class FSDPEngine(BaseEngine):
             per_tensor_param = (
                 (
                     name,
-                    param.to(device, non_blocking=True).full_tensor().to(torch.bfloat16, non_blocking=True)
+                    (
+                        param.to(device, non_blocking=True).full_tensor()
+                        if prequantized
+                        else param.to(device, non_blocking=True).full_tensor().to(torch.bfloat16, non_blocking=True)
+                    )
                     if isinstance(param, DTensor)
                     else param,
                 )
                 for name, param in params.items()
             )
+
+        if prequantized:
+            from verl.utils.qat.ascend_weight_sync import iter_ascend_weight_sync_params
+
+            return iter_ascend_weight_sync_params(per_tensor_param, plan), None
 
         if self._qat_enabled:
             from verl.utils.qat.mxfp_linear import is_mxfp_mode

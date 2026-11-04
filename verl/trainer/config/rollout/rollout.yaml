@@ -453,6 +453,10 @@ quantization_config_file: null
 # applied by vLLM-Ascend using the inherited actor QAT settings.
 qat_fake_quant: false
 
+# Receive trainer-exported Ascend parameters before startup profiling and on each update.
+# Requires FSDP2, the naive colocated backend, and qat_fake_quant=false.
+quantized_weight_sync: false
+
 # MTP configuration, reuse model configuration
 mtp: ${oc.select:actor_rollout_ref.model.mtp, null}
 

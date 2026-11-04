@@ -17,6 +17,7 @@ import inspect
 import json
 import logging
 import os
+from copy import deepcopy
 from pprint import pprint
 from typing import Any, Callable, Optional
 
@@ -233,6 +234,22 @@ class vLLMHttpServer:
             set_expandable_segments(True)
 
         quantization, hf_overrides = self._apply_quantization()
+        if self.config.get("quantized_weight_sync", False):
+            if engine_kwargs.get("speculative_config"):
+                raise ValueError("quantized_weight_sync does not support speculative decoding")
+            for key, required in {
+                "quantization": "ascend",
+                "worker_extension_cls": self._get_worker_extension_cls(),
+                "distributed_executor_backend": "mp",
+            }.items():
+                if key in engine_kwargs and engine_kwargs[key] != required:
+                    raise ValueError(f"quantized_weight_sync requires engine_kwargs.vllm.{key}={required!r}")
+            user_overrides = engine_kwargs.pop("hf_overrides", {}) or {}
+            if isinstance(user_overrides, str):
+                user_overrides = json.loads(user_overrides)
+            if "quantization_config" in user_overrides:
+                raise ValueError("quantized_weight_sync supplies quantization_config from the actor")
+            hf_overrides = {**user_overrides, **hf_overrides}
 
         compilation_config = engine_kwargs.pop("compilation_config", None) or {}
         if isinstance(compilation_config, str):
@@ -853,6 +870,25 @@ class vLLMHttpServer:
         quantization = self.config.quantization
         hf_overrides = {}
         os.environ["VLLM_ASCEND_QAT_FAKE_QUANT"] = "0"
+
+        if self.config.get("quantized_weight_sync", False):
+            if self.rollout_mode != RolloutMode.HYBRID or not is_torch_npu_available(check_device=False):
+                raise ValueError("quantized_weight_sync requires HYBRID rollout on Ascend")
+            extra = self.config.engine_kwargs.get("vllm", {}).get("model_loader_extra_config", {}) or {}
+            bootstrap = extra.get("verl_bootstrap")
+            if not bootstrap or not bootstrap.get("quant_description"):
+                raise ValueError("quantized_weight_sync must be launched through the trainer bootstrap")
+            if self.config.engine_kwargs.get("vllm", {}).get("load_format") != "verl_prequantized":
+                raise ValueError("quantized_weight_sync requires the verl_prequantized loader")
+            from verl.utils.vllm.prequantized_loader import register_prequantized_loader
+
+            register_prequantized_loader()
+            plugins = os.environ.get("VLLM_PLUGINS")
+            if plugins is not None and "verl_prequantized_loader" not in plugins.split(","):
+                os.environ["VLLM_PLUGINS"] = ",".join(filter(None, [plugins, "verl_prequantized_loader"]))
+            os.environ["VERL_VLLM_FP8_QUANT_ENABLED"] = "0"
+            self.global_steps = bootstrap["global_steps"]
+            return "ascend", {"quantization_config": deepcopy(dict(bootstrap["quant_description"]))}
 
         if getattr(self.config, "qat_fake_quant", False):
             from verl.utils.qat.vllm_ascend import mxfp_qat_config_to_vllm_ascend_env

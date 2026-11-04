@@ -23,6 +23,9 @@ license = {text = "Apache-2.0"}  # Changed from file to text format
 readme = {file = "README.md", content-type = "text/markdown"}
 requires-python = ">=3.10"
 
+[project.entry-points."vllm.general_plugins"]
+verl_prequantized_loader = "verl.utils.vllm.prequantized_loader:register_prequantized_loader"
+
 # -------------------------------
 # tool.ruff - Linting configuration
 # -------------------------------

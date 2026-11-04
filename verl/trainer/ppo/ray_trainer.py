@@ -939,9 +939,22 @@ class RayPPOTrainer:
         # two conditions satisfied: (1) no reward model, or (2) reward model with extra resource pool
         enable_agent_reward_loop = not self.use_rm or self.config.reward.reward_model.enable_resource_pool
 
-        self.llm_server_manager = LLMServerManager.create(
-            config=self.config, worker_group=self.actor_rollout_wg, rollout_resource_pool=actor_rollout_resource_pool
-        )
+        self._quantized_startup_done = False
+        if self.config.actor_rollout_ref.rollout.get("quantized_weight_sync", False):
+            from verl.utils.vllm.startup import create_prequantized_llm_server_manager
+
+            self.global_steps = 0
+            self._load_checkpoint()
+            self.llm_server_manager = create_prequantized_llm_server_manager(
+                self.config, self.actor_rollout_wg, actor_rollout_resource_pool, self.global_steps
+            )
+            self._quantized_startup_done = True
+        else:
+            self.llm_server_manager = LLMServerManager.create(
+                config=self.config,
+                worker_group=self.actor_rollout_wg,
+                rollout_resource_pool=actor_rollout_resource_pool,
+            )
 
         # if enable_agent_reward_loop, we directly pass reward_loop_workers to agent loop manager
         # to stream reward computation with actor rollout
@@ -969,7 +982,8 @@ class RayPPOTrainer:
         )
 
         # sleep all replicas to load checkpoint
-        self.checkpoint_manager.sleep_replicas()
+        if not self._quantized_startup_done:
+            self.checkpoint_manager.sleep_replicas()
 
     def _save_checkpoint(self):
         from verl.utils.fs import local_mkdir_safe
@@ -1402,11 +1416,12 @@ class RayPPOTrainer:
             config=OmegaConf.to_container(self.config, resolve=True),
         )
 
-        self.global_steps = 0
-
-        # load checkpoint and update weights before doing anything
-        self._load_checkpoint()
-        self.checkpoint_manager.update_weights(self.global_steps)
+        # The prequantized startup already restored the checkpoint and loaded its
+        # first batch before profiling. Keep both its step and its loaded weights.
+        if not getattr(self, "_quantized_startup_done", False):
+            self.global_steps = 0
+            self._load_checkpoint()
+            self.checkpoint_manager.update_weights(self.global_steps)
 
         current_epoch = self.global_steps // len(self.train_dataloader)
 

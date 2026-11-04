@@ -12,8 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .npu_vllm_patch import check_vllm_ascend_before_server_launch
-from .utils import TensorLoRARequest, VLLMHijack, is_version_ge
+from importlib import import_module
 
 # The contents of vllm/patch.py should not be imported here, because the contents of
 # patch.py should be imported after the vllm LLM instance is created. Therefore,
@@ -26,3 +25,17 @@ __all__ = [
     "is_version_ge",
     "check_vllm_ascend_before_server_launch",
 ]
+
+
+def __getattr__(name):
+    # Startup coordination also runs in the trainer/driver process. Importing
+    # that stdlib-only submodule must not initialize the vLLM runtime or patches.
+    if name not in __all__:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    module_name = ".npu_vllm_patch" if name == "check_vllm_ascend_before_server_launch" else ".utils"
+    if module_name == ".utils":
+        # Preserve the original runtime patch ordering for existing exports.
+        import_module(".npu_vllm_patch", __name__)
+    value = getattr(import_module(module_name, __name__), name)
+    globals()[name] = value
+    return value
