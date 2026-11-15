@@ -24,6 +24,13 @@ def _config(**kwargs):
     return MXFPQATConfig(mode="mxfp_w4a8", quant_backend="torch", **kwargs)
 
 
+@pytest.mark.parametrize("value", [-0.1, 1.1, float("nan"), float("inf"), True, "0.5", None])
+@pytest.mark.parametrize("field", ["activation_residual_fprop_alpha", "activation_residual_bprop_alpha"])
+def test_residual_config_rejects_invalid_alpha(field, value):
+    with pytest.raises(ValueError, match=field):
+        _config(**{field: value})
+
+
 def _grouped_matmul(x, weight, group_list, group_list_type, *, split_item=2, group_type=0):
     counts = group_list.tolist()
     if group_list_type == 0:
@@ -47,10 +54,14 @@ def test_activation_residual_switches_default_off():
 
 @pytest.mark.parametrize("rotation", [False, True])
 @pytest.mark.parametrize("grad_path", ["no_grad", "autograd", "custom"])
-def test_dense_full_activation_residual_uses_two_gemms_and_preserves_weight_error(monkeypatch, rotation, grad_path):
+@pytest.mark.parametrize("alpha", [0.25, 0.5, 0.75, 1.0])
+def test_dense_full_activation_residual_uses_two_gemms_and_preserves_weight_error(
+    monkeypatch, rotation, grad_path, alpha
+):
     torch.manual_seed(51)
     config = _config(
         activation_residual_fprop=True,
+        activation_residual_fprop_alpha=alpha,
         fake_quant_targets=("fprop", "dgrad", "wgrad") if grad_path == "custom" else ("fprop",),
         rotation_enable=rotation,
         rotation_targets=("fprop", "dgrad", "wgrad"),
@@ -74,7 +85,8 @@ def test_dense_full_activation_residual_uses_two_gemms_and_preserves_weight_erro
     assert linear_calls[1][2] is None
     values = rotate_blocks(x, config.rotation) if rotation else x
     weight = _target_tensor(qat.weight, config, "fprop", config.weight_format, probe_operand="weight")
-    expected = linear(values, weight, qat.bias)
+    aq = _target_tensor(x, config, "fprop", config.activation_format)
+    expected = linear(aq + alpha * (values - aq), weight, qat.bias)
     torch.testing.assert_close(output, expected, rtol=2e-5, atol=2e-6)
     assert not torch.allclose(output, linear(x, qat.weight, qat.bias), rtol=1e-3, atol=1e-3)
 
@@ -82,7 +94,10 @@ def test_dense_full_activation_residual_uses_two_gemms_and_preserves_weight_erro
 @pytest.mark.parametrize("targets", [("fprop",), ("fprop", "dgrad", "wgrad")])
 @pytest.mark.parametrize("rotation", [False, True])
 @pytest.mark.parametrize("cached_backward", [False, True])
-def test_dense_fprop_switch_preserves_existing_backward_with_fixed_output_gradient(targets, rotation, cached_backward):
+@pytest.mark.parametrize("alpha", [0.0, 0.5, 1.0])
+def test_dense_fprop_switch_preserves_existing_backward_with_fixed_output_gradient(
+    targets, rotation, cached_backward, alpha
+):
     torch.manual_seed(53)
     baseline = MXFPQATLinear(
         32,
@@ -96,7 +111,12 @@ def test_dense_fprop_switch_preserves_existing_backward_with_fixed_output_gradie
             rotation_seed=9,
         ),
     )
-    corrected = MXFPQATLinear(32, 64, True, replace(baseline.qat_config, activation_residual_fprop=True))
+    corrected = MXFPQATLinear(
+        32,
+        64,
+        True,
+        replace(baseline.qat_config, activation_residual_fprop=True, activation_residual_fprop_alpha=alpha),
+    )
     corrected.load_state_dict(baseline.state_dict())
     x = torch.randn(5, 32, requires_grad=True)
     x_corrected = x.detach().clone().requires_grad_()
@@ -313,11 +333,16 @@ def test_dense_backward_compensates_original_a_and_retains_main_g(targets, rotat
 
 @pytest.mark.parametrize("need_input_grad,need_weight_grad", [(True, True), (True, False), (False, True)])
 @pytest.mark.parametrize("bprop", [False, True])
+@pytest.mark.parametrize("alpha", [0.0, 0.5, 1.0])
 def test_dense_backward_only_saves_original_a_when_compensated_weight_grad_is_needed(
-    monkeypatch, need_input_grad, need_weight_grad, bprop
+    monkeypatch, need_input_grad, need_weight_grad, bprop, alpha
 ):
     torch.manual_seed(73)
-    config = _config(fake_quant_targets=("fprop", "dgrad", "wgrad"), activation_residual_bprop=bprop)
+    config = _config(
+        fake_quant_targets=("fprop", "dgrad", "wgrad"),
+        activation_residual_bprop=bprop,
+        activation_residual_bprop_alpha=alpha,
+    )
     qat = MXFPQATLinear(32, 64, False, config)
     qat.weight.requires_grad_(need_weight_grad)
     x = torch.randn(35, 32, requires_grad=need_input_grad)
@@ -342,12 +367,107 @@ def test_dense_backward_only_saves_original_a_when_compensated_weight_grad_is_ne
         output = qat(x)
     matmuls.clear()
     output.backward(torch.randn_like(output))
-    assert len(saved_raw_a) == int(bprop and need_weight_grad)
-    assert len(matmuls) == int(need_input_grad) + int(need_weight_grad) * (2 if bprop else 1)
-    if bprop and need_weight_grad:
+    active = bprop and alpha > 0
+    assert len(saved_raw_a) == int(active and need_weight_grad)
+    assert len(matmuls) == int(need_input_grad) + int(need_weight_grad) * (2 if active else 1)
+    if active and need_weight_grad:
         assert matmuls[-1][0] is matmuls[-2][0]
     assert (x.grad is not None) == need_input_grad
     assert (qat.weight.grad is not None) == need_weight_grad
+
+
+@pytest.mark.parametrize("alpha", [0.0, 0.25, 0.5, 0.75, 1.0])
+@pytest.mark.parametrize("moe", [False, True])
+@pytest.mark.parametrize("rotation", [False, True])
+def test_backward_alpha_interpolates_wgrad_with_fixed_g(monkeypatch, alpha, moe, rotation):
+    torch.manual_seed(83)
+    monkeypatch.setattr("verl.utils.qat.mxfp_moe._call_grouped_matmul", _grouped_matmul)
+    config = _config(
+        fake_quant_targets=("fprop", "dgrad", "wgrad"),
+        activation_residual_fprop=True,
+        activation_residual_fprop_alpha=0.5,
+        rotation_enable=rotation,
+        rotation_targets=("fprop", "dgrad", "wgrad"),
+    )
+    a = torch.randn(36, 32)
+    w = torch.randn(3, 32, 64) if moe else torch.randn(64, 32)
+    g = torch.randn(36, 64)
+    results = []
+    for enabled, strength in ((False, 1.0), (True, 1.0), (True, alpha)):
+        current = replace(config, activation_residual_bprop=enabled, activation_residual_bprop_alpha=strength)
+        x = a.clone().requires_grad_()
+        if moe:
+            weight = w.clone().requires_grad_()
+            output = mxfp_grouped_matmul(x, weight, torch.tensor([3, 0, 33]), current, name="alpha")
+        else:
+            layer = MXFPQATLinear(32, 64, False, current)
+            with torch.no_grad():
+                layer.weight.copy_(w)
+            weight = layer.weight
+            output = layer(x)
+        output.backward(g)
+        results.append((output.detach(), x.grad, weight.grad))
+    base, full, actual = results
+    torch.testing.assert_close(actual[0], base[0], rtol=0, atol=0)
+    torch.testing.assert_close(actual[1], base[1], rtol=0, atol=0)
+    torch.testing.assert_close(actual[2], base[2] + alpha * (full[2] - base[2]), rtol=3e-5, atol=3e-5)
+
+
+@pytest.mark.parametrize("alpha", [0.0, 0.25, 0.5, 0.75, 1.0])
+@pytest.mark.parametrize("rotation", [False, True])
+def test_moe_forward_alpha_and_zero_path(monkeypatch, alpha, rotation):
+    torch.manual_seed(89)
+    calls = []
+
+    def counted(*args, **kwargs):
+        calls.append(args)
+        return _grouped_matmul(*args, **kwargs)
+
+    monkeypatch.setattr("verl.utils.qat.mxfp_moe._call_grouped_matmul", counted)
+    config = _config(
+        fake_quant_targets=("fprop",),
+        activation_residual_fprop=True,
+        activation_residual_fprop_alpha=alpha,
+        rotation_enable=rotation,
+        rotation_targets=("fprop",),
+    )
+    x, w, groups = torch.randn(7, 32), torch.randn(3, 32, 64), torch.tensor([3, 0, 4])
+    output = mxfp_grouped_matmul(x, w, groups, config, name="alpha")
+    assert len(calls) == (1 if alpha == 0 else 2)
+    aq = prepare_mxfp_fprop_input(x, config)
+    ar = rotate_blocks(x, config.rotation) if rotation else x
+    wq = _transform_weight(w, config, "fprop", config.weight_format, reduction_dim=1)
+    expected = _grouped_matmul(aq + alpha * (ar - aq), wq, groups, 1)
+    torch.testing.assert_close(output, expected, rtol=2e-5, atol=2e-5)
+
+
+def test_dense_zero_alpha_uses_disabled_forward_and_backward_path(monkeypatch):
+    config = _config(
+        fake_quant_targets=("fprop",),
+        activation_residual_fprop=True,
+        activation_residual_bprop=True,
+        activation_residual_fprop_alpha=0.0,
+        activation_residual_bprop_alpha=0.0,
+    )
+    layer = MXFPQATLinear(32, 64, True, config)
+    baseline = MXFPQATLinear(
+        32, 64, True, replace(config, activation_residual_fprop=False, activation_residual_bprop=False)
+    )
+    baseline.load_state_dict(layer.state_dict())
+    x = torch.randn(7, 32, requires_grad=True)
+    other = x.detach().clone().requires_grad_()
+    with monkeypatch.context() as context:
+        context.setattr(
+            "verl.utils.qat.mxfp_linear._MXFPLinear.apply", lambda *a: pytest.fail("unexpected custom backward")
+        )
+        y = layer(x)
+    expected = baseline(other)
+    torch.testing.assert_close(y, expected, rtol=0, atol=0)
+    g = torch.randn_like(y)
+    y.backward(g)
+    expected.backward(g)
+    torch.testing.assert_close(x.grad, other.grad, rtol=0, atol=0)
+    torch.testing.assert_close(layer.weight.grad, baseline.weight.grad, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("targets", [("fprop",), ("wgrad",), ("fprop", "dgrad", "wgrad")])
@@ -428,7 +548,8 @@ def test_moe_backward_compensates_original_a_and_retains_main_g(
 
 
 @pytest.mark.parametrize("need_input_grad,need_weight_grad", [(True, True), (True, False), (False, True)])
-def test_moe_backward_compensation_respects_frozen_gradients(monkeypatch, need_input_grad, need_weight_grad):
+@pytest.mark.parametrize("alpha", [0.0, 0.5, 1.0])
+def test_moe_backward_compensation_respects_frozen_gradients(monkeypatch, need_input_grad, need_weight_grad, alpha):
     calls = []
 
     def counted_gmm(*args, **kwargs):
@@ -436,13 +557,17 @@ def test_moe_backward_compensation_respects_frozen_gradients(monkeypatch, need_i
         return _grouped_matmul(*args, **kwargs)
 
     monkeypatch.setattr("verl.utils.qat.mxfp_moe._call_grouped_matmul", counted_gmm)
-    config = _config(fake_quant_targets=("fprop", "dgrad", "wgrad"), activation_residual_bprop=True)
+    config = _config(
+        fake_quant_targets=("fprop", "dgrad", "wgrad"),
+        activation_residual_bprop=True,
+        activation_residual_bprop_alpha=alpha,
+    )
     x = torch.randn(7, 32, requires_grad=need_input_grad)
     weight = torch.randn(3, 32, 64, requires_grad=need_weight_grad)
     output = mxfp_grouped_matmul(x, weight, torch.tensor([3, 0, 4]), config, name="down_proj")
     calls.clear()
     output.sum().backward()
-    assert len(calls) == int(need_input_grad) + 2 * int(need_weight_grad)
+    assert len(calls) == int(need_input_grad) + (1 + int(alpha > 0)) * int(need_weight_grad)
     assert (x.grad is not None) == need_input_grad
     assert (weight.grad is not None) == need_weight_grad
 

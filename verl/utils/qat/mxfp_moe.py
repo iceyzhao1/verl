@@ -225,14 +225,17 @@ class _MXFPGroupedMatmul(torch.autograd.Function):
             config.rotation.enable and "fprop" in config.rotation.targets,
         )
         output = _call_grouped_matmul(x_fprop, weight_fprop, group_list, ctx.group_list_type)
-        if config.activation_residual_fprop:
+        if config.activation_residual_fprop_enabled:
             # Use the same coordinates and the same weight as the main branch,
             # including when gate/up share an externally prepared activation.
             values = x
             if config.rotation.enable and "fprop" in config.rotation.targets:
                 values = rotate_blocks(values, config.rotation)
             residual = values - x_fprop
-            output = output + _call_grouped_matmul(residual, weight_fprop, group_list, ctx.group_list_type)
+            correction = _call_grouped_matmul(residual, weight_fprop, group_list, ctx.group_list_type)
+            if config.activation_residual_fprop_alpha != 1.0:
+                correction = correction * config.activation_residual_fprop_alpha
+            output = output + correction
         return output
 
     @staticmethod
@@ -305,7 +308,7 @@ class _MXFPGroupedMatmul(torch.autograd.Function):
             x_wgrad, grad_output_wgrad, wgrad_group_list, valid_token_indices = _pad_expert_rows(
                 x, grad_output, group_list, group_list_type, config.group_size
             )
-            if config.activation_residual_bprop:
+            if config.activation_residual_bprop_enabled:
                 # Preserve the padded original A in the same token-rotation
                 # coordinates as the main branch, without residual QDQ.
                 x_wgrad_reference = x_wgrad
@@ -333,7 +336,7 @@ class _MXFPGroupedMatmul(torch.autograd.Function):
         elif need_weight_grad:
             x_wgrad = x_fprop
             grad_output_wgrad = grad_output
-            if config.activation_residual_bprop:
+            if config.activation_residual_bprop_enabled:
                 x_wgrad_reference = x
                 if config.rotation.enable and "fprop" in config.rotation.targets:
                     x_wgrad_reference = rotate_blocks(x_wgrad_reference, config.rotation)
@@ -348,9 +351,9 @@ class _MXFPGroupedMatmul(torch.autograd.Function):
                 split_item=3,
                 group_type=2,
             )
-            if config.activation_residual_bprop:
+            if config.activation_residual_bprop_enabled:
                 residual = x_wgrad_reference - x_wgrad
-                dw = dw + _call_grouped_matmul(
+                correction = _call_grouped_matmul(
                     residual.transpose(0, 1),
                     grad_output_wgrad,
                     wgrad_group_list,
@@ -358,6 +361,9 @@ class _MXFPGroupedMatmul(torch.autograd.Function):
                     split_item=3,
                     group_type=2,
                 )
+                if config.activation_residual_bprop_alpha != 1.0:
+                    correction = correction * config.activation_residual_bprop_alpha
+                dw = dw + correction
             if not _enabled(config, "wgrad"):
                 # The fallback uses fprop-rotated activations; map dw back to raw weight coordinates.
                 dw = _inverse_input_rotation(dw, config, feature_dim=1)

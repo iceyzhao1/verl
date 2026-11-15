@@ -73,6 +73,8 @@ def mxfp_qat_config_to_vllm_ascend_env(config: Mapping[str, Any]) -> dict[str, s
         fake_quant_targets=tuple(fake_quant_targets),
         activation_residual_fprop=bool(config.get("activation_residual_fprop", False)),
         activation_residual_bprop=bool(config.get("activation_residual_bprop", False)),
+        activation_residual_fprop_alpha=config.get("activation_residual_fprop_alpha", 1.0),
+        activation_residual_bprop_alpha=config.get("activation_residual_bprop_alpha", 1.0),
         rotation_enable=rotation_enable,
         rotation_targets=tuple(rotation_targets),
         rotation_block_size=rotation_block_size,
@@ -105,6 +107,7 @@ def mxfp_qat_config_to_vllm_ascend_env(config: Mapping[str, Any]) -> dict[str, s
         "VLLM_ASCEND_QAT_MXFP4_SCALE_ALG": qat_config.mxfp4_scale_alg,
         "VLLM_ASCEND_QAT_MXFP8_GROUP_SIZE": str(qat_config.group_size),
         "VLLM_ASCEND_QAT_MXFP8_ACTIVATION_RESIDUAL_FPROP": str(qat_config.activation_residual_fprop).lower(),
+        "VLLM_ASCEND_QAT_MXFP8_ACTIVATION_RESIDUAL_FPROP_ALPHA": str(qat_config.activation_residual_fprop_alpha),
         "VLLM_ASCEND_QAT_MXFP8_FAKE_QUANT_TARGETS": json.dumps(
             [target for target in ("fprop", "dgrad", "wgrad") if target in qat_config.fake_quant_targets]
         ),

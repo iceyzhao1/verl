@@ -46,6 +46,8 @@ class QATConfig(BaseConfig):
     activation_residual_fprop: bool = False
     # Compensate only the input A operand of Wgrad, using the same grad_output as the main path.
     activation_residual_bprop: bool = False
+    activation_residual_fprop_alpha: float = 1.0
+    activation_residual_bprop_alpha: float = 1.0
     rotation_enable: bool = False
     rotation_targets: list[str] = field(default_factory=lambda: ["Fprop"])
     rotation_block_size: int = 32
@@ -147,6 +149,8 @@ def apply_qat(
             backward_reduction_axis_fake_quant=config.backward_reduction_axis_fake_quant,
             activation_residual_fprop=config.activation_residual_fprop,
             activation_residual_bprop=config.activation_residual_bprop,
+            activation_residual_fprop_alpha=config.activation_residual_fprop_alpha,
+            activation_residual_bprop_alpha=config.activation_residual_bprop_alpha,
             rotation_enable=config.rotation_enable,
             rotation_targets=config.rotation_targets,
             rotation_block_size=config.rotation_block_size,
@@ -196,10 +200,13 @@ def apply_qat(
                 experts_enabled,
                 config.activation_residual_fprop,
                 config.activation_residual_bprop,
+                config.activation_residual_fprop_alpha,
+                config.activation_residual_bprop_alpha,
             ),
             "FSDP2 MXFP QAT configured: mode=%s dense_linear=%d moe_blocks=%d experts=%s "
             "fprop=%s dgrad=%s wgrad=%s rotation=%s rotation_targets=%s mxfp4_scale_alg=%s "
-            "backward_axis_cache=%s activation_residual_fprop=%s activation_residual_bprop=%s",
+            "backward_axis_cache=%s activation_residual_fprop=%s activation_residual_bprop=%s "
+            "activation_residual_fprop_alpha=%s activation_residual_bprop_alpha=%s",
             mxfp_mode.value,
             len(modules_to_replace),
             moe_count,
@@ -213,6 +220,8 @@ def apply_qat(
             mxfp_config.backward_reduction_axis_fake_quant,
             mxfp_config.activation_residual_fprop,
             mxfp_config.activation_residual_bprop,
+            mxfp_config.activation_residual_fprop_alpha,
+            mxfp_config.activation_residual_bprop_alpha,
         )
         return model
 

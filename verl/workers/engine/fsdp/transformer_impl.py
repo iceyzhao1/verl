@@ -516,6 +516,8 @@ class FSDPEngine(BaseEngine):
                 "backward_reduction_axis_fake_quant": self._qat_config.backward_reduction_axis_fake_quant,
                 "activation_residual_fprop": self._qat_config.activation_residual_fprop,
                 "activation_residual_bprop": self._qat_config.activation_residual_bprop,
+                "activation_residual_fprop_alpha": self._qat_config.activation_residual_fprop_alpha,
+                "activation_residual_bprop_alpha": self._qat_config.activation_residual_bprop_alpha,
                 "rotation_enable": self._qat_config.rotation_enable,
                 "rotation_targets": list(self._qat_config.rotation_targets),
                 "rotation_block_size": self._qat_config.rotation_block_size,

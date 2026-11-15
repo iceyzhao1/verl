@@ -125,6 +125,11 @@ qat:
   # Reuse the existing grad_output operand; do not compensate G, W, or Dgrad.
   activation_residual_bprop: false
 
+  # Independent A residual blend coefficients in [0, 1]; switches above still gate them.
+  # 1.0 preserves full compensation; 0.5 adds half the second GEMM/GMM output.
+  activation_residual_fprop_alpha: 1.0
+  activation_residual_bprop_alpha: 1.0
+
   # Enable deterministic block-local rotation before the selected MXFP transforms.
   rotation_enable: false
 

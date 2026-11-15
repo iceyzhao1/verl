@@ -16,13 +16,15 @@ pytest.importorskip("torch_npu", reason="Native Ascend test requires torch_npu")
 pytestmark = pytest.mark.skipif(not torch.npu.is_available(), reason="Ascend NPU is unavailable")
 
 
-def _config(fprop):
+def _config(fprop, alpha):
     return MXFPQATConfig(
         mode="mxfp_w4a8",
         quant_backend="torch",
         fake_quant_targets=("fprop", "dgrad", "wgrad"),
         activation_residual_fprop=fprop,
         activation_residual_bprop=True,
+        activation_residual_fprop_alpha=alpha,
+        activation_residual_bprop_alpha=alpha,
         rotation_enable=False,
         probe_quant_error=False,
     )
@@ -37,9 +39,10 @@ def _check_bf16_weight_grad(actual, reference):
 
 
 @pytest.mark.parametrize("fprop", [False, True])
-def test_dense_original_a_wgrad_on_native_npu(fprop):
+@pytest.mark.parametrize("alpha", [0.0, 0.5, 1.0])
+def test_dense_original_a_wgrad_on_native_npu(fprop, alpha):
     torch.manual_seed(101)
-    config = _config(fprop)
+    config = _config(fprop, alpha)
     baseline = MXFPQATLinear(
         32, 64, False, replace(config, activation_residual_bprop=False), device="npu", dtype=torch.bfloat16
     )
@@ -55,14 +58,18 @@ def test_dense_original_a_wgrad_on_native_npu(fprop):
     corrected_output.backward(g)
     torch.testing.assert_close(a_corrected.grad, a.grad, rtol=0, atol=0)
     g_main_t = _target_tensor(g.T, config, "wgrad", config.activation_format, probe_operand="grad_output")
-    reference = g_main_t.float().cpu() @ a.detach().float().cpu()
+    aq = _target_tensor(a.detach(), config, "fprop", config.activation_format)
+    aq_b = _target_tensor(aq.T, config, "wgrad", config.activation_format).T
+    blended_a = (1 - alpha) * aq_b.float().cpu() + alpha * a.detach().float().cpu()
+    reference = g_main_t.float().cpu() @ blended_a
     _check_bf16_weight_grad(corrected.weight.grad, reference)
 
 
 @pytest.mark.parametrize("fprop", [False, True])
-def test_moe_original_a_wgrad_on_native_npu_with_empty_expert(fprop):
+@pytest.mark.parametrize("alpha", [0.0, 0.5, 1.0])
+def test_moe_original_a_wgrad_on_native_npu_with_empty_expert(fprop, alpha):
     torch.manual_seed(103)
-    config = _config(fprop)
+    config = _config(fprop, alpha)
     a = torch.randn(64, 32, device="npu", dtype=torch.bfloat16, requires_grad=True)
     weight = torch.randn(3, 32, 64, device="npu", dtype=torch.bfloat16, requires_grad=True)
     a_corrected = a.detach().clone().requires_grad_()
@@ -80,7 +87,8 @@ def test_moe_original_a_wgrad_on_native_npu_with_empty_expert(fprop):
     # Each nonempty expert has exactly one 32-token quantization block, so a
     # direct per-expert reference needs no copy of production padding logic.
     g_main = _target_tensor(g.T, config, "wgrad", config.activation_format, probe_operand="grad_output").T
-    a_cpu = a.detach().float().cpu()
+    aq_b = _target_tensor(a.detach().T, config, "wgrad", config.activation_format).T
+    a_cpu = (1 - alpha) * aq_b.float().cpu() + alpha * a.detach().float().cpu()
     g_cpu = g_main.float().cpu()
     reference = torch.stack([a_cpu[:32].T @ g_cpu[:32], torch.zeros(32, 64), a_cpu[32:].T @ g_cpu[32:]])
     _check_bf16_weight_grad(weight_corrected.grad, reference)

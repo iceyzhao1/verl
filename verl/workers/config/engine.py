@@ -161,6 +161,8 @@ class QATEngineConfig(BaseConfig):
     activation_residual_fprop: bool = False
     # Full input-activation residual in Wgrad only; grad_output and Dgrad keep their existing precision.
     activation_residual_bprop: bool = False
+    activation_residual_fprop_alpha: float = 1.0
+    activation_residual_bprop_alpha: float = 1.0
     rotation_enable: bool = False
     rotation_targets: list[str] = field(default_factory=lambda: ["Fprop"])
     rotation_block_size: int = 32
